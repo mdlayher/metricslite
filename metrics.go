@@ -29,15 +29,37 @@ type Gauge func(value float64, labels ...string)
 //
 // If any Interface methods are used to create a metric with the same name as
 // a previously created metric, those methods should panic. Callers are expected
-// to create metrics once and pass them through their program as needed.
+// to create non-const metrics once and pass them through their program as needed.
 type Interface interface {
+	// Const metrics are used primarily when implementing Prometheus exporters
+	// or copying metrics from an external monitoring system. The ScrapeFunc
+	// is invoked on-demand when the metrics are gathered. Most applications
+	// should use the non-const Counter, Gauge, etc. instead.
+	ConstCounter(name, help string, labelNames []string, scrape ScrapeFunc)
+	ConstGauge(name, help string, labelNames []string, scrape ScrapeFunc)
+
+	// Non-const (or direct instrumentation) metrics are used to instrument
+	// normal Go applications. Their values are only updated when requested
+	// by the caller: not on-demand when metrics are gathered.
 	Counter(name, help string, labelNames ...string) Counter
 	Gauge(name, help string, labelNames ...string) Gauge
 }
 
+// A ScrapeFunc is a function which is invoked on demand to collect metric
+// labels and values for use in const metrics. The user should invoke collect
+// for any values they wish to export as metrics. If an error is returned, the
+// error will be reported by the metrics system.
+//
+// A ScrapeFunc must be safe for concurrent use. The number of label values
+// passed when collect is invoked must match the number of label names defined
+// when the const metric was created, or collect will panic.
+type ScrapeFunc func(collect func(value float64, labels ...string)) error
+
 // prom implements Interface by wrapping the Prometheus client library.
 type prom struct {
-	reg *prometheus.Registry
+	reg    *prometheus.Registry
+	mu     sync.Mutex
+	consts map[string]*promCollector
 }
 
 var _ Interface = &prom{}
@@ -45,7 +67,65 @@ var _ Interface = &prom{}
 // NewPrometheus creates an Interface which will register all of its metrics
 // to the specified Prometheus registry. The registry must not be nil.
 func NewPrometheus(reg *prometheus.Registry) Interface {
-	return &prom{reg: reg}
+	return &prom{
+		reg:    reg,
+		consts: make(map[string]*promCollector),
+	}
+}
+
+var _ prometheus.Collector = &promCollector{}
+
+// A promCollector implements prometheus.Collector to adapt Interface
+// const metrics to Prometheus format.
+type promCollector struct {
+	desc   *prometheus.Desc
+	value  prometheus.ValueType
+	scrape func(collect func(value float64, labels ...string)) error
+}
+
+// Describe implements prometheus.Collector.
+func (p *promCollector) Describe(ch chan<- *prometheus.Desc) { ch <- p.desc }
+
+// Collect implements prometheus.Collector.
+func (p *promCollector) Collect(ch chan<- prometheus.Metric) {
+	err := p.scrape(func(value float64, labels ...string) {
+		ch <- prometheus.MustNewConstMetric(p.desc, p.value, value, labels...)
+	})
+	if err != nil {
+		ch <- prometheus.NewInvalidMetric(p.desc, err)
+	}
+}
+
+// ConstCounter implements Interface.
+func (p *prom) ConstCounter(name, help string, labelNames []string, scrape ScrapeFunc) {
+	p.constBasic(prometheus.CounterValue, name, help, labelNames, scrape)
+}
+
+// ConstGauge implements Interface.
+func (p *prom) ConstGauge(name, help string, labelNames []string, scrape ScrapeFunc) {
+	p.constBasic(prometheus.GaugeValue, name, help, labelNames, scrape)
+}
+
+// constBasic registers const metrics with prom for primitive metrics types like
+// counters and gauges.
+func (p *prom) constBasic(value prometheus.ValueType, name, help string, labelNames []string, scrape ScrapeFunc) {
+	switch value {
+	case prometheus.CounterValue, prometheus.GaugeValue:
+	default:
+		panicf("metricslite: invalid prom.constBasic metric type: %T", value)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	c := &promCollector{
+		desc:   prometheus.NewDesc(name, help, labelNames, nil),
+		value:  value,
+		scrape: scrape,
+	}
+
+	p.consts[name] = c
+	p.reg.MustRegister(c)
 }
 
 // Counter implements Interface.
@@ -85,6 +165,12 @@ var _ Interface = discard{}
 // data.
 func Discard() Interface { return discard{} }
 
+// ConstCounter implements Interface.
+func (discard) ConstCounter(_, _ string, _ []string, _ ScrapeFunc) {}
+
+// ConstGauge implements Interface.
+func (discard) ConstGauge(_, _ string, _ []string, _ ScrapeFunc) {}
+
 // Counter implements Interface.
 func (discard) Counter(_, _ string, _ ...string) Counter { return func(_ ...string) {} }
 
@@ -96,6 +182,13 @@ func (discard) Gauge(_, _ string, _ ...string) Gauge { return func(_ float64, _ 
 type Memory struct {
 	mu     sync.Mutex
 	series map[string]*series
+	consts map[string]memoryConst
+}
+
+// A memoryConst stores metadata for a const metric.
+type memoryConst struct {
+	labelNames []string
+	scrape     ScrapeFunc
 }
 
 // Series produces a copy of all of the timeseries and samples stored by
@@ -103,6 +196,10 @@ type Memory struct {
 func (m *Memory) Series() map[string]Series {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Now that the caller is requesting output, scrape const metrics on demand
+	// to generate more timeseries.
+	m.scrapeConstLocked()
 
 	out := make(map[string]Series, len(m.series))
 	for k, v := range m.series {
@@ -117,7 +214,12 @@ func (m *Memory) Series() map[string]Series {
 }
 
 // NewMemory creates an initialized Memory.
-func NewMemory() *Memory { return &Memory{series: make(map[string]*series)} }
+func NewMemory() *Memory {
+	return &Memory{
+		series: make(map[string]*series),
+		consts: make(map[string]memoryConst),
+	}
+}
 
 // A Series is a timeseries with metadata and samples partitioned by labels.
 type Series struct {
@@ -129,6 +231,40 @@ type Series struct {
 type series struct {
 	Name, Help string
 	Samples    *sampleMap
+}
+
+// scrapeConstLocked updates const metrics. m.mu must be locked before calling
+// this function.
+func (m *Memory) scrapeConstLocked() {
+	for name, mc := range m.consts {
+		err := mc.scrape(func(value float64, labels ...string) {
+			m.series[name].Samples.Set(sampleKVs(name, mc.labelNames, labels), value)
+		})
+		if err != nil {
+			// No labels, so try to provide some indicator of a problem.
+			m.series[name].Samples.Set("", -1)
+		}
+	}
+}
+
+// ConstCounter implements Interface.
+func (m *Memory) ConstCounter(name, help string, labelNames []string, scrape ScrapeFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Samples map is updated on-demand and unneeded here.
+	_ = m.register(name, help, labelNames...)
+
+	m.consts[name] = memoryConst{
+		labelNames: labelNames,
+		scrape:     scrape,
+	}
+}
+
+// ConstGauge implements Interface.
+func (m *Memory) ConstGauge(name, help string, labelNames []string, scrape ScrapeFunc) {
+	// For Memory, these are identical.
+	m.ConstCounter(name, help, labelNames, scrape)
 }
 
 // Counter implements Interface.

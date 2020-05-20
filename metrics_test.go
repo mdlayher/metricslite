@@ -1,11 +1,13 @@
 package metricslite_test
 
 import (
+	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,18 +19,8 @@ import (
 )
 
 func TestPrometheus(t *testing.T) {
-	tests := []struct {
-		name string
-		fn   func(m metricslite.Interface)
-		body string
-	}{
-		{
-			name: "noop",
-		},
-		{
-			name: "counters",
-			fn:   testCounters,
-			body: `# HELP bar_total A second counter.
+	const (
+		counterOut = `# HELP bar_total A second counter.
 # TYPE bar_total counter
 bar_total 5
 # HELP foo_total A counter.
@@ -36,24 +28,63 @@ bar_total 5
 foo_total{address="127.0.0.1",interface="eth0"} 1
 foo_total{address="2001:db8::1",interface="eth1"} 1
 foo_total{address="::1",interface="eth0"} 1
-`,
-		},
-		{
-			name: "gauges",
-			fn:   testGauges,
-			body: `# HELP bar_bytes A second gauge.
+`
+
+		gaugeOut = `# HELP bar_bytes A second gauge.
 # TYPE bar_bytes gauge
 bar_bytes{device="eth0"} 1024
 # HELP foo_celsius A gauge.
 # TYPE foo_celsius gauge
 foo_celsius{probe="temp0"} 1
 foo_celsius{probe="temp1"} 100
-`,
+`
+	)
+
+	tests := []struct {
+		name string
+		fn   func(m metricslite.Interface)
+
+		// body is used for exact matches. bodyContains supports partial
+		// matching. Only one must be set at a time.
+		body         string
+		bodyContains string
+	}{
+		{
+			name: "noop",
+		},
+		{
+			name: "counters",
+			fn:   testCounters,
+			body: counterOut,
+		},
+		{
+			name: "const counters",
+			fn:   testConstCounters,
+			body: counterOut,
+		},
+		{
+			name: "gauges",
+			fn:   testGauges,
+			body: gaugeOut,
+		},
+		{
+			name: "const gauges",
+			fn:   testConstGauges,
+			body: gaugeOut,
+		},
+		{
+			name:         "const errors",
+			fn:           testConstErrors,
+			bodyContains: `* error collecting metric Desc{fqName: "errors_total", help: "An error.", constLabels: {}, variableLabels: []}: some error`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.body != "" && tt.bodyContains != "" {
+				t.Fatalf("both body %q and bodyContains %q were set", tt.body, tt.bodyContains)
+			}
+
 			reg := prometheus.NewPedanticRegistry()
 			m := metricslite.NewPrometheus(reg)
 			h := promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
@@ -84,14 +115,58 @@ foo_celsius{probe="temp1"} 100
 				t.Fatalf("failed to read HTTP response body: %v", err)
 			}
 
-			if diff := cmp.Diff(tt.body, string(body)); diff != "" {
-				t.Fatalf("unexpected HTTP body (-want +got):\n%s", diff)
+			if tt.body != "" {
+				// Exact body check.
+				if diff := cmp.Diff(tt.body, string(body)); diff != "" {
+					t.Fatalf("unexpected HTTP body (-want +got):\n%s", diff)
+				}
+				return
+			}
+
+			// Body contains check.
+			if !strings.Contains(string(body), tt.bodyContains) {
+				t.Fatalf("failed to find substring in body:\n%s", string(body))
 			}
 		})
 	}
 }
 
 func TestMemory(t *testing.T) {
+	var (
+		counters = map[string]metricslite.Series{
+			"bar_total": {
+				Name:    "bar_total",
+				Help:    "A second counter.",
+				Samples: map[string]float64{"": 5},
+			},
+			"foo_total": {
+				Name: "foo_total",
+				Help: "A counter.",
+				Samples: map[string]float64{
+					"address=127.0.0.1,interface=eth0":   1,
+					"address=2001:db8::1,interface=eth1": 1,
+					"address=::1,interface=eth0":         1,
+				},
+			},
+		}
+
+		gauges = map[string]metricslite.Series{
+			"bar_bytes": {
+				Name:    "bar_bytes",
+				Help:    "A second gauge.",
+				Samples: map[string]float64{"device=eth0": 1024},
+			},
+			"foo_celsius": {
+				Name: "foo_celsius",
+				Help: "A gauge.",
+				Samples: map[string]float64{
+					"probe=temp0": 1,
+					"probe=temp1": 100,
+				},
+			},
+		}
+	)
+
 	tests := []struct {
 		name  string
 		fn    func(m metricslite.Interface)
@@ -102,41 +177,41 @@ func TestMemory(t *testing.T) {
 			final: map[string]metricslite.Series{},
 		},
 		{
-			name: "counters",
-			fn:   testCounters,
-			final: map[string]metricslite.Series{
-				"bar_total": {
-					Name:    "bar_total",
-					Help:    "A second counter.",
-					Samples: map[string]float64{"": 5},
-				},
-				"foo_total": {
-					Name: "foo_total",
-					Help: "A counter.",
-					Samples: map[string]float64{
-						"address=127.0.0.1,interface=eth0":   1,
-						"address=2001:db8::1,interface=eth1": 1,
-						"address=::1,interface=eth0":         1,
-					},
-				},
-			},
+			name:  "counters",
+			fn:    testCounters,
+			final: counters,
 		},
 		{
-			name: "gauges",
-			fn:   testGauges,
+			name:  "const counters",
+			fn:    testConstCounters,
+			final: counters,
+		},
+		{
+			name:  "gauges",
+			fn:    testGauges,
+			final: gauges,
+		},
+		{
+			name:  "const gauges",
+			fn:    testConstGauges,
+			final: gauges,
+		},
+		{
+			name: "const errors",
+			fn:   testConstErrors,
 			final: map[string]metricslite.Series{
-				"bar_bytes": {
-					Name:    "bar_bytes",
-					Help:    "A second gauge.",
-					Samples: map[string]float64{"device=eth0": 1024},
-				},
-				"foo_celsius": {
-					Name: "foo_celsius",
-					Help: "A gauge.",
+				"errors_present": {
+					Name: "errors_present",
+					Help: "Another error.",
 					Samples: map[string]float64{
-						"probe=temp0": 1,
-						"probe=temp1": 100,
+						"":               -1,
+						"type=permanent": 10,
 					},
+				},
+				"errors_total": {
+					Name:    "errors_total",
+					Help:    "An error.",
+					Samples: map[string]float64{"": -1},
 				},
 			},
 		},
@@ -241,8 +316,20 @@ func TestDiscardDoesNotPanic(t *testing.T) {
 			fn:   testCounters,
 		},
 		{
+			name: "const counters",
+			fn:   testConstCounters,
+		},
+		{
 			name: "gauges",
 			fn:   testGauges,
+		},
+		{
+			name: "const gauges",
+			fn:   testConstGauges,
+		},
+		{
+			name: "const errors",
+			fn:   testConstErrors,
 		},
 	}
 
@@ -286,6 +373,74 @@ func testGauges(m metricslite.Interface) {
 	g1(1, "temp0")
 
 	g2(1024, "eth0")
+}
+
+func testConstCounters(m metricslite.Interface) {
+	m.ConstCounter(
+		"foo_total",
+		"A counter.",
+		[]string{"address", "interface"},
+		func(c1 func(value float64, labels ...string)) error {
+			c1(1, "127.0.0.1", "eth0")
+			c1(1, "::1", "eth0")
+			c1(1, "2001:db8::1", "eth1")
+
+			return nil
+		},
+	)
+
+	m.ConstCounter(
+		"bar_total",
+		"A second counter.",
+		nil,
+		func(c2 func(value float64, labels ...string)) error {
+			c2(5)
+			return nil
+		},
+	)
+}
+
+func testConstGauges(m metricslite.Interface) {
+	m.ConstGauge(
+		"foo_celsius",
+		"A gauge.",
+		[]string{"probe"},
+		func(g1 func(value float64, labels ...string)) error {
+			g1(100, "temp1")
+			g1(1, "temp0")
+
+			return nil
+		},
+	)
+
+	m.ConstGauge(
+		"bar_bytes",
+		"A second gauge.",
+		[]string{"device"},
+		func(g2 func(value float64, labels ...string)) error {
+			g2(1024, "eth0")
+			return nil
+		},
+	)
+}
+
+func testConstErrors(m metricslite.Interface) {
+	m.ConstCounter("errors_total", "An error.", nil, func(_ func(_ float64, _ ...string)) error {
+		return errors.New("some error")
+	})
+
+	m.ConstGauge("errors_present", "Another error.", []string{"type"}, func(collect func(_ float64, _ ...string)) error {
+		for i, t := range []string{"permanent", "temporary"} {
+			// First scrape succeeds, second returns an error.
+			if i == 0 {
+				collect(10, t)
+			} else {
+				return errors.New("some error")
+			}
+		}
+
+		return nil
+	})
 }
 
 func panics(fn func()) (msg string, panics bool) {
