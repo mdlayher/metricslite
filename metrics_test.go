@@ -256,6 +256,16 @@ func TestMemoryPanics(t *testing.T) {
 				c("panics")
 			},
 		},
+		{
+			name: "no for each function",
+			msg:  "metricslite: Interface collected const metrics invoked before calling OnConstScrape",
+			fn: func(m *metricslite.Memory) {
+				m.ConstCounter("foo_total", "A counter.")
+
+				// Force a metrics scrape.
+				_ = m.Series()
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -376,66 +386,72 @@ func testGauges(m metricslite.Interface) {
 }
 
 func testConstCounters(m metricslite.Interface) {
-	m.ConstCounter(
-		"foo_total",
-		"A counter.",
-		[]string{"address", "interface"},
-		func(c1 func(value float64, labels ...string)) error {
-			c1(1, "127.0.0.1", "eth0")
-			c1(1, "::1", "eth0")
-			c1(1, "2001:db8::1", "eth1")
-
-			return nil
-		},
+	const (
+		fooTotal = "foo_total"
+		barTotal = "bar_total"
 	)
 
-	m.ConstCounter(
-		"bar_total",
-		"A second counter.",
-		nil,
-		func(c2 func(value float64, labels ...string)) error {
-			c2(5)
-			return nil
-		},
-	)
+	m.ConstCounter(fooTotal, "A counter.", "address", "interface")
+	m.ConstCounter(barTotal, "A second counter.")
+
+	m.OnConstScrape(func(name string, collect func(float64, ...string)) error {
+		switch name {
+		case fooTotal:
+			collect(1, "127.0.0.1", "eth0")
+			collect(1, "::1", "eth0")
+			collect(1, "2001:db8::1", "eth1")
+		case barTotal:
+			collect(5)
+		}
+
+		return nil
+	})
 }
 
 func testConstGauges(m metricslite.Interface) {
-	m.ConstGauge(
-		"foo_celsius",
-		"A gauge.",
-		[]string{"probe"},
-		func(g1 func(value float64, labels ...string)) error {
-			g1(100, "temp1")
-			g1(1, "temp0")
-
-			return nil
-		},
+	const (
+		fooCelsius = "foo_celsius"
+		barBytes   = "bar_bytes"
 	)
 
-	m.ConstGauge(
-		"bar_bytes",
-		"A second gauge.",
-		[]string{"device"},
-		func(g2 func(value float64, labels ...string)) error {
-			g2(1024, "eth0")
-			return nil
-		},
-	)
+	m.ConstGauge(fooCelsius, "A gauge.", "probe")
+	m.ConstGauge(barBytes, "A second gauge.", "device")
+
+	m.OnConstScrape(func(name string, collect func(float64, ...string)) error {
+		switch name {
+		case fooCelsius:
+			collect(100, "temp1")
+			collect(1, "temp0")
+		case barBytes:
+			collect(1024, "eth0")
+		}
+
+		return nil
+	})
 }
 
 func testConstErrors(m metricslite.Interface) {
-	m.ConstCounter("errors_total", "An error.", nil, func(_ func(_ float64, _ ...string)) error {
-		return errors.New("some error")
-	})
+	const (
+		errorsTotal   = "errors_total"
+		errorsPresent = "errors_present"
+	)
 
-	m.ConstGauge("errors_present", "Another error.", []string{"type"}, func(collect func(_ float64, _ ...string)) error {
-		for i, t := range []string{"permanent", "temporary"} {
-			// First scrape succeeds, second returns an error.
-			if i == 0 {
-				collect(10, t)
-			} else {
-				return errors.New("some error")
+	m.ConstCounter(errorsTotal, "An error.")
+	m.ConstGauge("errors_present", "Another error.", "type")
+
+	err := errors.New("some error")
+	m.OnConstScrape(func(name string, collect func(float64, ...string)) error {
+		switch name {
+		case errorsTotal:
+			return err
+		case errorsPresent:
+			for i, t := range []string{"permanent", "temporary"} {
+				// First scrape succeeds, second returns an error.
+				if i == 0 {
+					collect(10, t)
+				} else {
+					return err
+				}
 			}
 		}
 
