@@ -104,7 +104,6 @@ func NewPrometheus(reg *prometheus.Registry) Interface {
 
 // A promConst stores information about a Prometheus const metric.
 type promConst struct {
-	name  string
 	desc  *prometheus.Desc
 	value prometheus.ValueType
 }
