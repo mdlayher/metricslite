@@ -50,14 +50,29 @@ type Interface interface {
 }
 
 // A ScrapeFunc is a function which is invoked on demand to collect metric
-// labels and values for the named const metric. The user should invoke collect
-// for any values they wish to export as metrics. If an error is returned, the
-// error will be reported by the metrics system.
+// labels and values for each const metric present in the map key for metrics.
+// The user should invoke the collect function for any values they wish to
+// export as metrics. If an error of type *ScrapeError is returned, the error
+// will be reported to the metrics system.
 //
 // A ScrapeFunc must be safe for concurrent use. The number of label values
 // passed when collect is invoked must match the number of label names defined
 // when the const metric was created, or collect will panic.
-type ScrapeFunc func(name string, collect func(value float64, labels ...string)) error
+type ScrapeFunc func(metrics map[string]func(value float64, labels ...string)) error
+
+var _ error = &ScrapeError{}
+
+// A ScrapeError allows a ScrapeFunc to report a specific metric as the cause
+// of a failed metrics scrape.
+type ScrapeError struct {
+	Metric string
+	Err    error
+}
+
+// Error implements error.
+func (e *ScrapeError) Error() string {
+	return fmt.Sprintf("%q: %v", e.Metric, e.Err)
+}
 
 // prom implements Interface by wrapping the Prometheus client library.
 type prom struct {
@@ -77,7 +92,7 @@ var (
 func NewPrometheus(reg *prometheus.Registry) Interface {
 	p := &prom{
 		reg: reg,
-		scrape: func(_ string, _ func(float64, ...string)) error {
+		scrape: func(_ map[string]func(float64, ...string)) error {
 			panic("metricslite: Interface collected const metrics invoked before calling OnConstScrape")
 		},
 		consts: make(map[string]*promConst),
@@ -87,9 +102,9 @@ func NewPrometheus(reg *prometheus.Registry) Interface {
 	return p
 }
 
-// A promCollector implements prometheus.Collector to adapt Interface
-// const metrics to Prometheus format.
+// A promConst stores information about a Prometheus const metric.
 type promConst struct {
+	name  string
 	desc  *prometheus.Desc
 	value prometheus.ValueType
 }
@@ -109,14 +124,41 @@ func (p *prom) Collect(ch chan<- prometheus.Metric) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	if len(p.consts) == 0 {
+		return
+	}
+
+	metrics := make(map[string]func(float64, ...string), len(p.consts))
 	for name, c := range p.consts {
-		err := p.scrape(name, func(value float64, labels ...string) {
+		// Shadow c for each closure.
+		c := c
+		metrics[name] = func(value float64, labels ...string) {
 			ch <- prometheus.MustNewConstMetric(c.desc, c.value, value, labels...)
-		})
-		if err != nil {
-			ch <- prometheus.NewInvalidMetric(c.desc, err)
 		}
 	}
+
+	err := p.scrape(metrics)
+	if err == nil {
+		return
+	}
+
+	// Scrape failed, try to report more information.
+	serr, ok := err.(*ScrapeError)
+	if !ok {
+		// Cannot report on error!
+		return
+	}
+
+	c, ok := p.consts[serr.Metric]
+	if !ok {
+		// Caller reported an invalid metric name. In theory this will trigger
+		// an HTTP 500 which will cause Prometheus to fail the scrape, so it
+		// is suitable for our purposes.
+		panicf("metricslite: *ScrapeError contained non-existent metric %q", serr.Metric)
+		return
+	}
+
+	ch <- prometheus.NewInvalidMetric(c.desc, serr.Err)
 }
 
 // OnConstScrape implements Interface.
@@ -241,7 +283,7 @@ func (m *Memory) Series() map[string]Series {
 func NewMemory() *Memory {
 	return &Memory{
 		series: make(map[string]*series),
-		scrape: func(_ string, _ func(float64, ...string)) error {
+		scrape: func(_ map[string]func(float64, ...string)) error {
 			panic("metricslite: Interface collected const metrics invoked before calling OnConstScrape")
 		},
 		consts: make(map[string][]string),
@@ -270,15 +312,42 @@ func (m *Memory) OnConstScrape(scrape ScrapeFunc) {
 // scrapeConstLocked updates const metrics. m.mu must be locked before calling
 // this function.
 func (m *Memory) scrapeConstLocked() {
+	if len(m.consts) == 0 {
+		return
+	}
+
+	metrics := make(map[string]func(float64, ...string), len(m.consts))
 	for name, labelNames := range m.consts {
-		err := m.scrape(name, func(value float64, labels ...string) {
+		// Shadow key/value for each closure.
+		var (
+			name       = name
+			labelNames = labelNames
+		)
+
+		metrics[name] = func(value float64, labels ...string) {
 			m.series[name].Samples.Set(sampleKVs(name, labelNames, labels), value)
-		})
-		if err != nil {
-			// No labels, so try to provide some indicator of a problem.
-			m.series[name].Samples.Set("", -1)
 		}
 	}
+
+	err := m.scrape(metrics)
+	if err == nil {
+		return
+	}
+
+	// Scrape failed, try to report more information.
+	serr, ok := err.(*ScrapeError)
+	if !ok {
+		// Cannot report on error!
+		return
+	}
+
+	if _, ok := m.consts[serr.Metric]; !ok {
+		// Caller reported an invalid metric name. Since Memory is more likely
+		// to be used in tests, panic to let them know.
+		panicf("metricslite: *ScrapeError contained non-existent metric %q", serr.Metric)
+	}
+
+	m.series[serr.Metric].Samples.Set("", -1)
 }
 
 // ConstCounter implements Interface.

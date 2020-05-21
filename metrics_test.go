@@ -75,7 +75,7 @@ foo_celsius{probe="temp1"} 100
 		{
 			name:         "const errors",
 			fn:           testConstErrors,
-			bodyContains: `* error collecting metric Desc{fqName: "errors_total", help: "An error.", constLabels: {}, variableLabels: []}: some error`,
+			bodyContains: `error collecting metric Desc{fqName: "errors_present", help: "An error.", constLabels: {}, variableLabels: [type]}: some error`,
 		},
 	}
 
@@ -202,16 +202,11 @@ func TestMemory(t *testing.T) {
 			final: map[string]metricslite.Series{
 				"errors_present": {
 					Name: "errors_present",
-					Help: "Another error.",
+					Help: "An error.",
 					Samples: map[string]float64{
 						"":               -1,
 						"type=permanent": 10,
 					},
-				},
-				"errors_total": {
-					Name:    "errors_total",
-					Help:    "An error.",
-					Samples: map[string]float64{"": -1},
 				},
 			},
 		},
@@ -261,6 +256,23 @@ func TestMemoryPanics(t *testing.T) {
 			msg:  "metricslite: Interface collected const metrics invoked before calling OnConstScrape",
 			fn: func(m *metricslite.Memory) {
 				m.ConstCounter("foo_total", "A counter.")
+
+				// Force a metrics scrape.
+				_ = m.Series()
+			},
+		},
+		{
+			name: "invalid scrape error metric",
+			msg:  `metricslite: *ScrapeError contained non-existent metric "bar_bytes"`,
+			fn: func(m *metricslite.Memory) {
+				// Set some metric to ensure ScrapeFunc is invoked.
+				m.ConstCounter("foo_total", "A counter.")
+				m.OnConstScrape(func(_ map[string]func(float64, ...string)) error {
+					return &metricslite.ScrapeError{
+						Metric: "bar_bytes",
+						Err:    errors.New("some error"),
+					}
+				})
 
 				// Force a metrics scrape.
 				_ = m.Series()
@@ -394,14 +406,16 @@ func testConstCounters(m metricslite.Interface) {
 	m.ConstCounter(fooTotal, "A counter.", "address", "interface")
 	m.ConstCounter(barTotal, "A second counter.")
 
-	m.OnConstScrape(func(name string, collect func(float64, ...string)) error {
-		switch name {
-		case fooTotal:
-			collect(1, "127.0.0.1", "eth0")
-			collect(1, "::1", "eth0")
-			collect(1, "2001:db8::1", "eth1")
-		case barTotal:
-			collect(5)
+	m.OnConstScrape(func(metrics map[string]func(float64, ...string)) error {
+		for m, collect := range metrics {
+			switch m {
+			case fooTotal:
+				collect(1, "127.0.0.1", "eth0")
+				collect(1, "::1", "eth0")
+				collect(1, "2001:db8::1", "eth1")
+			case barTotal:
+				collect(5)
+			}
 		}
 
 		return nil
@@ -417,13 +431,15 @@ func testConstGauges(m metricslite.Interface) {
 	m.ConstGauge(fooCelsius, "A gauge.", "probe")
 	m.ConstGauge(barBytes, "A second gauge.", "device")
 
-	m.OnConstScrape(func(name string, collect func(float64, ...string)) error {
-		switch name {
-		case fooCelsius:
-			collect(100, "temp1")
-			collect(1, "temp0")
-		case barBytes:
-			collect(1024, "eth0")
+	m.OnConstScrape(func(metrics map[string]func(float64, ...string)) error {
+		for m, collect := range metrics {
+			switch m {
+			case fooCelsius:
+				collect(100, "temp1")
+				collect(1, "temp0")
+			case barBytes:
+				collect(1024, "eth0")
+			}
 		}
 
 		return nil
@@ -431,26 +447,24 @@ func testConstGauges(m metricslite.Interface) {
 }
 
 func testConstErrors(m metricslite.Interface) {
-	const (
-		errorsTotal   = "errors_total"
-		errorsPresent = "errors_present"
-	)
+	const errorsPresent = "errors_present"
+	m.ConstGauge(errorsPresent, "An error.", "type")
 
-	m.ConstCounter(errorsTotal, "An error.")
-	m.ConstGauge("errors_present", "Another error.", "type")
+	m.OnConstScrape(func(metrics map[string]func(float64, ...string)) error {
+		for m, collect := range metrics {
+			switch m {
+			case errorsPresent:
+				for i, t := range []string{"permanent", "temporary"} {
+					// First scrape succeeds, second returns an error.
+					if i == 0 {
+						collect(10, t)
+						continue
+					}
 
-	err := errors.New("some error")
-	m.OnConstScrape(func(name string, collect func(float64, ...string)) error {
-		switch name {
-		case errorsTotal:
-			return err
-		case errorsPresent:
-			for i, t := range []string{"permanent", "temporary"} {
-				// First scrape succeeds, second returns an error.
-				if i == 0 {
-					collect(10, t)
-				} else {
-					return err
+					return &metricslite.ScrapeError{
+						Metric: m,
+						Err:    errors.New("some error"),
+					}
 				}
 			}
 		}
