@@ -248,7 +248,15 @@ func TestMemoryPanics(t *testing.T) {
 			msg:  `metricslite: mismatched label cardinality for timeseries "foo_total"`,
 			fn: func(m *metricslite.Memory) {
 				c := m.Counter("foo_total", "A counter.")
-				c("panics")
+				c(1.0, "panics")
+			},
+		},
+		{
+			name: "counter decrement",
+			msg:  `metricslite: counter must be called with a zero or positive value`,
+			fn: func(m *metricslite.Memory) {
+				c := m.Counter("foo_total", "A counter.")
+				c(-1, "panics")
 			},
 		},
 		{
@@ -373,14 +381,12 @@ func testCounters(m metricslite.Interface) {
 		c2 = m.Counter("bar_total", "A second counter.")
 	)
 
-	// A counter increments for each call with a given label set.
-	c1("127.0.0.1", "eth0")
-	c1("::1", "eth0")
-	c1("2001:db8::1", "eth1")
+	// A counter adds values for each call with a given label set.
+	c1(1.0, "127.0.0.1", "eth0")
+	c1(1.0, "::1", "eth0")
+	c1(1.0, "2001:db8::1", "eth1")
 
-	for i := 0; i < 5; i++ {
-		c2()
-	}
+	c2(5.0)
 }
 
 func testGauges(m metricslite.Interface) {

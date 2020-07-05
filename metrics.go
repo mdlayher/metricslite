@@ -8,13 +8,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// A Counter is a function which increments a metric's value by 1 when invoked.
-// Labels enable optional partitioning of a Counter into multiple dimensions.
+// A Counter is a function which increments a metric's value by value when
+// invoked. Value must be zero or positive or the Counter will panic. Labels
+// enable optional partitioning of a Counter into multiple dimensions.
 //
 // Counters must be safe for concurrent use. The number of label values passed
-// when the Counter is invoked must match the number of label names defined
-// when the Counter was created, or the Counter will panic.
-type Counter func(labels ...string)
+// when the Counter is invoked must match the number of label names defined when
+// the Counter was created, or the Counter will panic.
+type Counter func(value float64, labels ...string)
 
 // A Gauge is a function which sets a metric's value when invoked.
 // Labels enable optional partitioning of a Gauge into multiple dimensions.
@@ -204,8 +205,13 @@ func (p *prom) Counter(name, help string, labelNames ...string) Counter {
 
 	p.reg.MustRegister(c)
 
-	return func(labels ...string) {
-		c.WithLabelValues(labels...).Inc()
+	return func(value float64, labels ...string) {
+		// Counters cannot be decremented.
+		if value < 0 {
+			panic("metricslite: counter must be called with a zero or positive value")
+		}
+
+		c.WithLabelValues(labels...).Add(value)
 	}
 }
 
@@ -242,7 +248,14 @@ func (discard) ConstGauge(_, _ string, _ ...string) {}
 func (discard) OnConstScrape(_ ScrapeFunc) {}
 
 // Counter implements Interface.
-func (discard) Counter(_, _ string, _ ...string) Counter { return func(_ ...string) {} }
+func (discard) Counter(_, _ string, _ ...string) Counter {
+	return func(value float64, _ ...string) {
+		// Counters cannot be decremented.
+		if value < 0 {
+			panic("metricslite: counter must be called with a zero or positive value")
+		}
+	}
+}
 
 // Gauge implements Interface.
 func (discard) Gauge(_, _ string, _ ...string) Gauge { return func(_ float64, _ ...string) {} }
@@ -373,12 +386,16 @@ func (m *Memory) Counter(name, help string, labelNames ...string) Counter {
 
 	samples := m.register(name, help, labelNames...)
 
-	return func(labels ...string) {
+	return func(value float64, labels ...string) {
+		// Counters cannot be decremented.
+		if value < 0 {
+			panic("metricslite: counter must be called with a zero or positive value")
+		}
+
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
-		// Counter always increment.
-		samples.Inc(sampleKVs(name, labelNames, labels))
+		samples.Add(sampleKVs(name, labelNames, labels), value)
 	}
 }
 
@@ -435,11 +452,11 @@ func (sm *sampleMap) Clone() map[string]float64 {
 	return samples
 }
 
-// Inc increments the value of k by 1.
-func (sm *sampleMap) Inc(k string) {
+// Add adds v to the value stored in k.
+func (sm *sampleMap) Add(k string, v float64) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.m[k]++
+	sm.m[k] += v
 }
 
 // Set stores k=v in the map.
